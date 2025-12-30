@@ -9,6 +9,9 @@ const axios = require("axios");
 
 const dataCache = new Map();
 const CACHE_DURATION = 60000; // Add this line at top
+const yahooFinance = new YahooFinance({
+  suppressNotices: ["yahooSurvey"],
+});
 
 function excelToJSON(path) {
   const workbook = xlsx.readFile(path);
@@ -92,13 +95,38 @@ const structureJSONData = (rowData) => {
 async function getStockData() {
   try {
     const query = "AAPL"; // Apple stock ticker
-    const yahooFinance = new YahooFinance();
+    const yahooFinance = new YahooFinance({
+      suppressNotices: ["yahooSurvey"],
+    });
     const result = await yahooFinance.search("Apple");
     const quote = await yahooFinance.quote("AAPL");
-    // console.log(result);
-    // console.log(quote)
+    console.log(result);
+    console.log(quote);
   } catch (error) {
     console.error("Error fetching data:", error);
+  }
+}
+
+async function getYahooPrice(symbol) {
+  const cacheKey = `yahoo_${symbol}`;
+  const cached = dataCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    return cached.data;
+  }
+
+  try {
+    const quote = await yahooFinance.quote(symbol);
+
+    if (!quote || !quote.regularMarketPrice) {
+      console.log("No price data found for ", symbol);
+      return null;
+    }
+    const price = quote.regularMarketPrice;
+    dataCache.set(cacheKey, { data: price, timestamp: Date.now() });
+    return price;
+  } catch (error) {
+    console.error(`Error fetching price for ${symbol}:`, error.message);
+    return null;
   }
 }
 
@@ -112,6 +140,25 @@ const AXIOS_OPTIONS = {
     hl: "en", // parameter defines the language to use for the Google search
   },
 };
+
+async function findSymbolByName(companyName) {
+  try {
+    const searchResults = await yahooFinance.search(companyName);
+
+    const indianStock = searchResults.quotes?.find(
+      (quote) => quote.symbol.endsWith(".NS") || quote.symbol.endsWith(".BO")
+    );
+
+    if (indianStock) {
+      console.log(`Found symbol ${indianStock.symbol} for ${companyName}`);
+      return indianStock.symbol;
+    }
+    return null;
+  } catch (error) {
+    console.error(`Error finding symbol for ${companyName}:`, error.message);
+    return null;
+  }
+}
 
 async function scrapeGoogleFinance(symbol) {
   const cacheKey = `google_${symbol}`;
@@ -138,33 +185,51 @@ async function scrapeGoogleFinance(symbol) {
     require("fs").writeFileSync("google_debug.html", data);
 
     const $ = cheerio.load(data);
+    let price = null;
 
     let peRatio = null;
     let latestEarnings = null;
 
-    // Log all text to find the pattern
-    console.log("=== Searching for PE ratio and EPS ===");
-    $("div").each((i, elem) => {
-      const text = $(elem).text().trim();
+    const priceSelectors = [
+      "[data-last-price]",
+      ".YMlKec.fxKbKc",
+      '[jsname="ip75Cb"]',
+      ".P6K39c",
+      "[data-symbol] [data-last-price]",
+    ];
 
-      if (text.includes("PE ratio") || text.includes("EPS")) {
-        console.log(`Found: "${text}"`);
-        console.log(`Next sibling: "${$(elem).next().text()}"`);
-        console.log(`Parent: "${$(elem).parent().text().substring(0, 100)}"`);
-        console.log("---");
+    for (let selector of priceSelectors) {
+      const element = $(selector).first();
+      if (element.length) {
+        const text =
+          element.text() ||
+          element.attr("data-last-price") ||
+          element.attr("data-symbol");
+
+        if (text) {
+          const numericPrice = parseFloat(text.replace(/[₹,\s]/g, ""));
+          if (!isNaN(numericPrice) && numericPrice > 0) {
+            price = numericPrice;
+            console.log(`Found price ${price} for ${symbol}`);
+            break;
+          }
+        }
       }
-    });
+    }
 
-    const result = { peRatio, latestEarnings };
-    dataCache.set(cacheKey, { data, timestamp: Date.now() });
-    return result;
+    if (!price) {
+      console.log(`No price found for ${symbol}`);
+      return null;
+    }
+
+    // const result = { peRatio, latestEarnings };
+    dataCache.set(cacheKey, { data: price, timestamp: Date.now() });
+    return price;
   } catch (error) {
     console.error(`Google scrape error for ${symbol}:`, error.message);
-    return { peRatio: null, latestEarnings: null };
+    return null;
   }
 }
-
-scrapeGoogleFinance("RELIANCE.NS").then(console.log);
 
 const app = express();
 
@@ -172,11 +237,38 @@ app.use(cors());
 app.use(morgan("dev"));
 app.use(express.json());
 
-app.get("/api/portfolio", (req, res) => {
+app.get("/api/portfolio", async (req, res) => {
   try {
     const filePath = path.join(__dirname, "data.xlsx");
     const jsonData = excelToJSON(filePath);
     const portfolio = structureJSONData(jsonData);
+
+    for (let stock of portfolio) {
+      let livePrice = await getYahooPrice(stock.symbol);
+
+      if (!livePrice) {
+        const foundSymbol = await findSymbolByName(stock.name);
+        if (foundSymbol) {
+          livePrice = await getYahooPrice(foundSymbol);
+          if (livePrice) {
+            stock.symbol = foundSymbol;
+            console.log(
+              `Updated ${stock.name} symbol to ${foundSymbol} with price ${livePrice}`
+            );
+          }
+        }
+      }
+      if (!livePrice) {
+        livePrice = await scrapeGoogleFinance(stock.symbol);
+      }
+
+      if (livePrice) {
+        stock.cmp = livePrice;
+        stock.presentValue = livePrice * stock.qty;
+        stock.gainLoss = stock.presentValue - stock.investment;
+        stock.gainLossPercent = (stock.gainLoss / stock.investment) * 100;
+      }
+    }
 
     const sectorMap = new Map();
     portfolio.forEach((stock) => {
@@ -211,6 +303,24 @@ app.get("/api/portfolio", (req, res) => {
     console.error(error);
   }
 });
+
+app.get("/api/portfolio/stream", (req, res)=> {
+  res.writeHead(200, {
+    'content-type': "text/event-stream",
+    "cache-control": "no-cache",
+    "connection": "keep-alive",
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "Cache-Control"
+  })
+
+  const sendPortfolioUpdate = async ()=> {
+    try {
+      
+    } catch (error) {
+      
+    }
+  }
+})
 
 app.listen(4000, () => {
   console.log("Server is running on port 4000");
