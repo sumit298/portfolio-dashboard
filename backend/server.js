@@ -6,6 +6,7 @@ const path = require("path");
 const YahooFinance = require("yahoo-finance2").default;
 const cheerio = require("cheerio");
 const axios = require("axios");
+const { clearInterval } = require("timers");
 
 const dataCache = new Map();
 const CACHE_DURATION = 60000; // Add this line at top
@@ -304,23 +305,98 @@ app.get("/api/portfolio", async (req, res) => {
   }
 });
 
-app.get("/api/portfolio/stream", (req, res)=> {
+app.get("/api/portfolio/stream", (req, res) => {
   res.writeHead(200, {
-    'content-type': "text/event-stream",
-    "cache-control": "no-cache",
-    "connection": "keep-alive",
-    "access-control-allow-origin": "*",
-    "access-control-allow-headers": "Cache-Control"
-  })
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Cache-Control",
+  });
 
-  const sendPortfolioUpdate = async ()=> {
+  const sendPortfolioUpdate = async () => {
     try {
-      
+      const filePath = path.join(__dirname, "data.xlsx");
+      const jsonData = excelToJSON(filePath);
+      const portfolio = structureJSONData(jsonData);
+
+      for (let stock of portfolio) {
+        let livePrice = await getYahooPrice(stock.symbol);
+        if (!livePrice) {
+          const foundSymbol = await findSymbolByName(stock.name);
+          if (foundSymbol) {
+            livePrice = await getYahooPrice(foundSymbol);
+            if (livePrice) {
+              stock.symbol = foundSymbol;
+              console.log(
+                `Updated ${stock.name} symbol to ${foundSymbol} with price ${livePrice}`
+              );
+            }
+          }
+        }
+        if (!livePrice) {
+          livePrice = await scrapeGoogleFinance(stock.symbol);
+        }
+
+        if (livePrice) {
+          stock.cmp = livePrice;
+          stock.presentValue = livePrice * stock.qty;
+          stock.gainLoss = stock.presentValue - stock.investment;
+          stock.gainLossPercent = (stock.gainLoss / stock.investment) * 100;
+        }
+      }
+
+      const sectorMap = new Map();
+      portfolio.forEach((stock) => {
+        const sector = stock.sector;
+        if (!sectorMap.has(sector)) {
+          sectorMap.set(sector, []);
+        }
+        sectorMap.get(sector).push(stock);
+      });
+
+      const sectors = Array.from(sectorMap.entries()).map(
+        ([sector, stocks]) => {
+          const totalInvestment = stocks.reduce(
+            (sum, s) => sum + s.investment,
+            0
+          );
+          const totalPresentValue = stocks.reduce(
+            (sum, s) => sum + s.presentValue,
+            0
+          );
+          const gainLoss = totalPresentValue - totalInvestment;
+          const gainLossPercent = (gainLoss / totalInvestment) * 100;
+
+          return {
+            sector,
+            totalInvestment,
+            presentValue: totalPresentValue,
+            gainLoss,
+            gainLossPercent,
+            stocks,
+          };
+        }
+      );
+      res.write(
+        `data: ${JSON.stringify({ success: true, data: sectors })}\n\n`
+      );
     } catch (error) {
-      
+      res.write(
+        `data: ${JSON.stringify({ success: false, error: error.message })}\n\n`
+      );
     }
-  }
-})
+  };
+
+  sendPortfolioUpdate();
+  const interval = setInterval(sendPortfolioUpdate, 30000);
+
+  req.on("close", () => {
+    clearInterval(interval);
+  });
+});
+
+// sending update every 30 seconds
 
 app.listen(4000, () => {
   console.log("Server is running on port 4000");
